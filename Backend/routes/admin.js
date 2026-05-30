@@ -19,6 +19,46 @@ router.get('/employees', async (req, res) => {
   }
 });
 
+// Dashboard stats
+router.get('/stats', async (req, res) => {
+  try {
+    const employees = await User.find({ role: 'employee' });
+    const trips = await Trip.find();
+    const activeTrips = trips.filter(t => t.status === 'active');
+    const activeEmployeeIds = new Set(
+      activeTrips.map(t => t.user?.toString()).filter(Boolean)
+    );
+
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    const weeklyTrips = trips.filter(t => new Date(t.startTime) >= weekAgo);
+
+    const dailyData = [];
+    for (let i = 6; i >= 0; i--) {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      const dayTrips = trips.filter(t => {
+        const tripDate = new Date(t.startTime);
+        return tripDate.toDateString() === date.toDateString();
+      });
+      dailyData.push({
+        label: date.toLocaleDateString('en', { weekday: 'short' }),
+        trips: dayTrips.length
+      });
+    }
+
+    res.json({
+      totalEmployees: employees.length,
+      activeEmployees: activeEmployeeIds.size,
+      totalTrips: trips.length,
+      activeTrips: activeTrips.length,
+      dailyData
+    });
+  } catch (err) {
+    res.status(500).json({ msg: 'Server Error' });
+  }
+});
+
 // Get trip history for an employee
 router.get('/trips/:employeeId', async (req, res) => {
   try {

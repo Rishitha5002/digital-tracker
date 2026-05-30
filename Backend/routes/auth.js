@@ -3,6 +3,7 @@ import axios from 'axios';
 import User from '../models/User.js';
 import Otp from '../models/Otp.js';
 import admin from '../config/firebase.js';
+import { verifyToken } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
@@ -12,22 +13,29 @@ const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 // @route   POST api/auth/register
 // @desc    Create User in Firebase & MongoDB (Server-Side)
 router.post('/register', async (req, res) => {
-  const { name, email, password, role } = req.body;
+  const { name, email, password, role, designation } = req.body;
 
   try {
-    // 1. Create User in Firebase
+    // 1. Check if user already exists in MongoDB
+    const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
+    if (existingUser) {
+      return res.status(400).json({ msg: 'Email already exists' });
+    }
+
+    // 2. Create User in Firebase
     const firebaseUser = await admin.auth().createUser({
-      email,
+      email: email.toLowerCase().trim(),
       password,
       displayName: name,
     });
 
-    // 2. Create User in MongoDB
+    // 3. Create User in MongoDB
     const user = new User({
       name,
-      email,
+      email: email.toLowerCase().trim(),
       firebaseUid: firebaseUser.uid,
-      role: role || 'employee'
+      role: role || 'employee',
+      designation: designation || ''
     });
 
     await user.save();
@@ -36,7 +44,13 @@ router.post('/register', async (req, res) => {
   } catch (err) {
     console.error("Register Error:", err);
     if(err.code === 'auth/email-already-exists') {
-        return res.status(400).json({ msg: 'Email already exists' });
+        return res.status(400).json({ msg: 'Email already exists in Firebase' });
+    }
+    if(err.code === 'auth/invalid-email') {
+        return res.status(400).json({ msg: 'Invalid email format' });
+    }
+    if(err.code === 'auth/weak-password') {
+        return res.status(400).json({ msg: 'Password is too weak (minimum 6 characters)' });
     }
     res.status(500).json({ msg: 'Server error', error: err.message });
   }
@@ -61,17 +75,22 @@ router.post('/login', async (req, res) => {
       returnSecureToken: true
     });
 
-    const { idToken, localId } = response.data;
+    const { idToken, refreshToken, localId } = response.data;
 
     // 3. Return Token & User Info
     res.json({
       token: idToken,
+      refreshToken: refreshToken,
       user: {
         id: user._id,
         name: user.name,
         email: user.email,
         role: user.role,
-        firebaseUid: localId
+        designation: user.designation,
+        phone: user.phone,
+        profilePicture: user.profilePicture,
+        firebaseUid: localId,
+        createdAt: user.createdAt
       }
     });
 
@@ -103,31 +122,28 @@ router.post('/send-reset-email', async (req, res) => {
       });
     }
 
-    // 3. Send password reset email using Firebase REST API
-    // Firebase will automatically send an email with a reset link/code
-    const resetUrl = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FIREBASE_API_KEY}`;
-    
-    await axios.post(resetUrl, {
-      requestType: 'PASSWORD_RESET',
-      email: email
-    });
+    // 3. Generate OTP and save to database
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    await Otp.findOneAndUpdate(
+      { email: email.toLowerCase().trim() },
+      { otp, expiresAt },
+      { upsert: true, new: true }
+    );
+
+    // 4. Log OTP for development (in production, send via email service)
+    console.log(`Password Reset OTP for ${email}: ${otp}`);
+    console.log(`OTP expires at: ${expiresAt}`);
 
     res.json({ 
-      msg: 'Password reset email sent successfully. Check your inbox.',
-      success: true 
+      msg: `Password reset OTP sent. Development mode - OTP: ${otp}`,
+      success: true,
+      otp: otp // Only for development - remove in production
     });
 
   } catch (err) {
-    console.error('Send Reset Email Error:', err.response ? err.response.data : err.message);
-    
-    // Don't expose internal errors to user
-    if (err.response?.data?.error?.message === 'EMAIL_NOT_FOUND') {
-      return res.json({ 
-        msg: 'If this email is registered, a password reset link has been sent.',
-        success: true 
-      });
-    }
-    
+    console.error('Send Reset Email Error:', err.message);
     res.status(500).json({ msg: 'Failed to send reset email. Please try again.' });
   }
 });
@@ -214,65 +230,195 @@ router.post('/confirm-password-reset', async (req, res) => {
 // ============================================================================
 
 // @route   POST api/auth/forgot-password
-// @desc    Generate Custom OTP for Password Reset (stored in MongoDB)
+// @desc    Send Firebase Password Reset Email (uses Firebase's built-in email system)
 router.post('/forgot-password', async (req, res) => {
   const { email } = req.body;
-  
+
   try {
     if (!email) {
       return res.status(400).json({ msg: 'Email is required' });
     }
 
     const user = await User.findOne({ email: email.toLowerCase().trim() });
-    
+
     // For security, don't reveal if email exists
     if (!user) {
-      return res.json({ 
-        msg: 'If this email is registered, an OTP has been sent.',
-        success: true 
+      return res.json({
+        msg: 'If this email is registered, a password reset link has been sent.',
+        success: true
       });
     }
 
-    // Generate 6 digit OTP
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    // Send password reset email using Firebase REST API
+    const resetUrl = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${FIREBASE_API_KEY}`;
 
-    // Delete any existing OTPs for this email
-    await Otp.deleteMany({ email: email.toLowerCase().trim() });
-
-    // Save new OTP to DB (Expires in 5 mins defined in Model)
-    await Otp.create({ 
-      email: email.toLowerCase().trim(), 
-      otp: otpCode 
+    await axios.post(resetUrl, {
+      requestType: 'PASSWORD_RESET',
+      email: email
     });
 
-    // Send OTP via Firebase Email (using custom email template)
-    try {
-      // Generate a custom token for this user
-      const customToken = await admin.auth().createCustomToken(user.firebaseUid);
-      
-      // You can send custom email using Firebase Admin SDK
-      // Or integrate with SendGrid, AWS SES, etc.
-      
-      // For now, log it (you should replace this with actual email sending)
-      console.log(`[OTP] for ${email}: ${otpCode}`);
-      
-      // TODO: Implement email sending here
-      // Example: await sendOTPEmail(email, otpCode, user.name);
-      
-    } catch (emailErr) {
-      console.error('Email sending error:', emailErr);
-    }
-
-    res.json({ 
-      msg: 'OTP sent successfully. Check your email.',
-      success: true,
-      // Remove this in production - for testing only:
-      dev_otp: process.env.NODE_ENV === 'development' ? otpCode : undefined
+    res.json({
+      msg: 'Password reset email sent successfully. Check your inbox.',
+      success: true
     });
 
   } catch (err) {
-    console.error('Forgot Password Error:', err);
-    res.status(500).json({ msg: 'Server error. Please try again.' });
+    console.error('Forgot Password Error:', err.response ? err.response.data : err.message);
+
+    // Don't expose internal errors to user
+    if (err.response?.data?.error?.message === 'EMAIL_NOT_FOUND') {
+      return res.json({
+        msg: 'If this email is registered, a password reset link has been sent.',
+        success: true
+      });
+    }
+
+    res.status(500).json({ msg: 'Failed to send reset email. Please try again.' });
+  }
+});
+
+// @route   GET api/auth/me
+router.get('/me', verifyToken, async (req, res) => {
+  res.json({
+    id: req.user._id,
+    name: req.user.name,
+    email: req.user.email,
+    role: req.user.role,
+    designation: req.user.designation,
+    phone: req.user.phone,
+    profilePicture: req.user.profilePicture,
+    createdAt: req.user.createdAt,
+    notificationSettings: req.user.notificationSettings
+  });
+});
+
+// @route   POST api/auth/change-password
+router.post('/change-password', verifyToken, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+
+  try {
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ msg: 'Current and new password are required' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ msg: 'Password must be at least 6 characters' });
+    }
+
+    const url = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`;
+    await axios.post(url, {
+      email: req.user.email,
+      password: currentPassword,
+      returnSecureToken: true
+    });
+
+    await admin.auth().updateUser(req.user.firebaseUid, { password: newPassword });
+
+    res.json({ msg: 'Password updated successfully', success: true });
+  } catch (err) {
+    console.error('Change Password Error:', err.response?.data || err.message);
+    if (err.response?.data?.error?.message === 'INVALID_PASSWORD' ||
+        err.response?.data?.error?.message === 'INVALID_LOGIN_CREDENTIALS') {
+      return res.status(400).json({ msg: 'Current password is incorrect' });
+    }
+    res.status(500).json({ msg: 'Failed to update password' });
+  }
+});
+
+// @route   GET/PUT api/auth/notification-settings
+router.get('/notification-settings', verifyToken, async (req, res) => {
+  res.json(req.user.notificationSettings || {});
+});
+
+router.put('/notification-settings', verifyToken, async (req, res) => {
+  try {
+    const settings = req.body;
+    req.user.notificationSettings = {
+      ...req.user.notificationSettings?.toObject?.() || req.user.notificationSettings || {},
+      ...settings
+    };
+    await req.user.save();
+    res.json({ msg: 'Settings saved', notificationSettings: req.user.notificationSettings });
+  } catch (err) {
+    res.status(500).json({ msg: 'Failed to save settings' });
+  }
+});
+
+// @route   PUT api/auth/update-email
+router.put('/update-email', verifyToken, async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    if (!email) {
+      return res.status(400).json({ msg: 'Email is required' });
+    }
+
+    const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
+    if (existingUser && existingUser._id.toString() !== req.user._id.toString()) {
+      return res.status(400).json({ msg: 'Email already exists' });
+    }
+
+    await admin.auth().updateUser(req.user.firebaseUid, { email: email.toLowerCase().trim() });
+    req.user.email = email.toLowerCase().trim();
+    await req.user.save();
+
+    res.json({ msg: 'Email updated successfully', email: req.user.email });
+  } catch (err) {
+    console.error('Update Email Error:', err.message);
+    res.status(500).json({ msg: 'Failed to update email' });
+  }
+});
+
+// @route   PUT api/auth/update-role
+router.put('/update-role', verifyToken, async (req, res) => {
+  const { role } = req.body;
+
+  try {
+    if (!role) {
+      return res.status(400).json({ msg: 'Role is required' });
+    }
+
+    if (!['employee', 'admin'].includes(role)) {
+      return res.status(400).json({ msg: 'Invalid role' });
+    }
+
+    req.user.role = role;
+    await req.user.save();
+
+    res.json({ msg: 'Role updated successfully', role: req.user.role });
+  } catch (err) {
+    console.error('Update Role Error:', err.message);
+    res.status(500).json({ msg: 'Failed to update role' });
+  }
+});
+
+// @route   PUT api/auth/update-profile
+router.put('/update-profile', verifyToken, async (req, res) => {
+  const { name, designation, phone, profilePicture } = req.body;
+
+  try {
+    if (name) req.user.name = name;
+    if (designation !== undefined) req.user.designation = designation;
+    if (phone !== undefined) req.user.phone = phone;
+    if (profilePicture !== undefined) req.user.profilePicture = profilePicture;
+
+    await req.user.save();
+
+    res.json({
+      msg: 'Profile updated successfully',
+      user: {
+        id: req.user._id,
+        name: req.user.name,
+        email: req.user.email,
+        role: req.user.role,
+        designation: req.user.designation,
+        profilePicture: req.user.profilePicture,
+        phone: req.user.phone,
+        createdAt: req.user.createdAt
+      }
+    });
+  } catch (err) {
+    console.error('Update Profile Error:', err.message);
+    res.status(500).json({ msg: 'Failed to update profile' });
   }
 });
 
